@@ -10,3 +10,5 @@ llama-index-vector-stores-deeplake==0.4.0
 aiosqlite
 sqlalchemy>=2.0
 typing_extensions>=4.8.0
+langgraph-checkpoint-sqlite==2.0.11
+
