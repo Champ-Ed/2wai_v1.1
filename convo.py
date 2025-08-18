@@ -85,8 +85,8 @@ class DiskTidStore:
 class AgentState(TypedDict, total=False):
     user_input: str
     session: Dict[str, Any]
-    # Use a LangGraph channel so values append across nodes/turns and persist in checkpoints
-    scratchpad: Annotated[List[str], operator.add]
+    # Use a simple list with manual deduplication - operator.add may be causing issues
+    scratchpad: List[str]
     selected_context: str
     compressed_history: str
     agent_context: str
@@ -350,8 +350,8 @@ class OrchestratedConversationalSystem:
         self.agent = agent
         self.store = DeepLakePDFStore(commit_batch=8, debug=self.debug)
         # thresholds (configurable via session)
-        self.max_turns = session.get("max_turns", 6)
-        self.summarize_after_turns = session.get("summarize_after_turns", 6)
+        self.max_turns = session.get("max_turns", 12)
+        self.summarize_after_turns = session.get("summarize_after_turns", 12)
         # Load persona template (path can be overridden via session)
         self.persona_template = _read_persona_template(
             session.get("persona_prompt_path", "calum_prompt_v2.1.yaml")
@@ -379,7 +379,7 @@ class OrchestratedConversationalSystem:
         # Small instructive prompt to summarizer LLM
         prompt = (
             f"You are {self.session.get('persona_name','Calum Worthy')}. "
-            f"Summarize this conversation in 1-2 witty sentences:\n{' | '.join(history)}"
+            f"Summarize this conversation in 1-2 witty sentences especially remembering peculiar things:\n{' | '.join(history)}"
         )
         try:
             client = openai.OpenAI(
@@ -415,10 +415,22 @@ class OrchestratedConversationalSystem:
             user_input = stt.get("user_input")
             if not user_input:
                 return stt
-            # Emit only the delta so the channel (operator.add) appends to prior history
-            stt["scratchpad"] = [f"User: {user_input}"]
+            
+            # Get existing scratchpad and append new entry
+            existing_scratchpad = stt.get("scratchpad", []) or []
+            new_entry = f"User: {user_input}"
+            
+            # Simple deduplication: don't add if it's identical to the last entry
+            if not existing_scratchpad or existing_scratchpad[-1] != new_entry:
+                new_scratchpad = list(existing_scratchpad) + [new_entry]
+                stt["scratchpad"] = new_scratchpad
+                if self.debug:
+                    print(f"[NODE] Added user entry, new length: {len(new_scratchpad)}")
+            else:
+                if self.debug:
+                    print(f"[NODE] Skipped duplicate user entry")
+            
             if self.debug:
-                print(f"[NODE] Emitted delta to scratchpad: {stt['scratchpad']}")
                 print("[NODE] write_context exit")
             return stt
 
@@ -474,12 +486,17 @@ class OrchestratedConversationalSystem:
             if self.debug:
                 print("[NODE] compress_context enter")
             st = dict(state)
-            if len(st.get("scratchpad", [])) >= self.summarize_after_turns:
-                summary = await self._summarize_history(st.get("scratchpad", []))
+            scratchpad = st.get("scratchpad", []) or []
+            if len(scratchpad) >= self.summarize_after_turns:
+                summary = await self._summarize_history(scratchpad)
                 if summary:
-                    # Add summary immediately (but async to avoid blocking)
+                    if self.debug:
+                        print(f"[NODE] compress_context: summarizing {len(scratchpad)} entries")
+                    # Add summary to memory store
                     asyncio.create_task(self.store.add_memory(self.agent, f"Summary: {summary}"))
                     st["compressed_history"] = summary
+                    # Note: We don't truncate the scratchpad here with operator.add
+                    # The truncation will be handled during persistence
             if self.debug:
                 print("[NODE] compress_context exit")
             return st
@@ -501,6 +518,8 @@ class OrchestratedConversationalSystem:
         async def llm_node(state: AgentState) -> AgentState:
             if self.debug:
                 print("[NODE] llm enter")
+                existing_scratchpad = state.get("scratchpad", [])
+                print(f"[NODE] LLM - Incoming scratchpad length: {len(existing_scratchpad)}")
             stt = dict(state)
             # Otherwise, call LLM with context
             try:
@@ -521,12 +540,23 @@ class OrchestratedConversationalSystem:
                     )
                 resp = await asyncio.to_thread(_call_llm)
                 answer = resp.choices[0].message.content.strip()
-                # Emit only the assistant line as delta; channel will append
-                stt["scratchpad"] = [f"{self.session.get('persona_name','Calum')}: {answer}"]
+                
+                # Get existing scratchpad and append assistant response
+                existing_scratchpad = stt.get("scratchpad", []) or []
+                new_entry = f"{self.session.get('persona_name','Calum')}: {answer}"
+                
+                # Simple deduplication: don't add if it's identical to the last entry
+                if not existing_scratchpad or existing_scratchpad[-1] != new_entry:
+                    new_scratchpad = list(existing_scratchpad) + [new_entry]
+                    stt["scratchpad"] = new_scratchpad
+                    if self.debug:
+                        print(f"[NODE] LLM - Added assistant entry, new length: {len(new_scratchpad)}")
+                    asyncio.create_task(self.store.add_memory(self.agent, new_entry))
+                else:
+                    if self.debug:
+                        print(f"[NODE] LLM - Skipped duplicate assistant entry")
+                
                 stt["response"] = answer
-                if self.debug:
-                    print(f"[NODE] Emitted delta to scratchpad: {stt['scratchpad']}")
-                asyncio.create_task(self.store.add_memory(self.agent, stt["scratchpad"][0]))
             except Exception as e:
                 if self.debug:
                     print("[LLM ERROR]", repr(e))
@@ -586,23 +616,37 @@ class OrchestratedConversationalSystem:
         if self.debug:
             print(f"[TURN] Using thread_id: {thread_id}")
         
-        # Seed from disk if no checkpoint exists for this tid
-        seed_state: AgentState = {}
+        # Check if checkpointer already has state for this thread
+        has_checkpoint = False
         try:
             existing_state = self.checkpointer.get(config)
-            if not existing_state:
-                disk_seed = self._load_thread_from_disk(thread_id)
-                if disk_seed.get("scratchpad"):
-                    seed_state.update(disk_seed)
-        except Exception:
-            # On any error, still try to seed from disk
+            has_checkpoint = existing_state is not None
+            if self.debug:
+                print(f"[TURN] Checkpoint exists: {has_checkpoint}")
+        except Exception as e:
+            if self.debug:
+                print(f"[TURN] Error checking checkpoint: {e}")
+            has_checkpoint = False
+        
+        # Only seed from disk if no checkpoint exists
+        input_state: AgentState = {"user_input": user_input}
+        if not has_checkpoint:
             disk_seed = self._load_thread_from_disk(thread_id)
             if disk_seed.get("scratchpad"):
-                seed_state.update(disk_seed)
+                input_state.update(disk_seed)
+                if self.debug:
+                    print(f"[TURN] Seeded from disk: {len(disk_seed.get('scratchpad', []))} entries")
+                    print(f"[TURN] Input state scratchpad: {disk_seed.get('scratchpad', [])}")
+        else:
+            if self.debug:
+                print("[TURN] Using existing checkpoint, not seeding from disk")
+        
+        if self.debug:
+            print(f"[TURN] About to invoke graph with input_state keys: {list(input_state.keys())}")
+            if 'scratchpad' in input_state:
+                print(f"[TURN] Input scratchpad length: {len(input_state['scratchpad'])}")
         
         # Let LangGraph handle state restoration via checkpointer
-        input_state: AgentState = {"user_input": user_input, **seed_state}
-        
         final_state = await self.graph.ainvoke(input_state, config=config)
         
         if self.debug:
@@ -636,22 +680,37 @@ class OrchestratedConversationalSystem:
         if self.debug:
             print(f"[TURN_FAST] Using thread_id: {thread_id}")
         
-        # Seed from disk if no checkpoint exists for this tid
-        seed_state: AgentState = {}
+        # Check if checkpointer already has state for this thread
+        has_checkpoint = False
         try:
             existing_state = self.checkpointer.get(config)
-            if not existing_state:
-                disk_seed = self._load_thread_from_disk(thread_id)
-                if disk_seed.get("scratchpad"):
-                    seed_state.update(disk_seed)
-        except Exception:
+            has_checkpoint = existing_state is not None
+            if self.debug:
+                print(f"[TURN_FAST] Checkpoint exists: {has_checkpoint}")
+        except Exception as e:
+            if self.debug:
+                print(f"[TURN_FAST] Error checking checkpoint: {e}")
+            has_checkpoint = False
+        
+        # Only seed from disk if no checkpoint exists
+        input_state: AgentState = {"user_input": user_input}
+        if not has_checkpoint:
             disk_seed = self._load_thread_from_disk(thread_id)
             if disk_seed.get("scratchpad"):
-                seed_state.update(disk_seed)
+                input_state.update(disk_seed)
+                if self.debug:
+                    print(f"[TURN_FAST] Seeded from disk: {len(disk_seed.get('scratchpad', []))} entries")
+                    print(f"[TURN_FAST] Input state scratchpad: {disk_seed.get('scratchpad', [])}")
+        else:
+            if self.debug:
+                print("[TURN_FAST] Using existing checkpoint, not seeding from disk")
+        
+        if self.debug:
+            print(f"[TURN_FAST] About to invoke graph with input_state keys: {list(input_state.keys())}")
+            if 'scratchpad' in input_state:
+                print(f"[TURN_FAST] Input scratchpad length: {len(input_state['scratchpad'])}")
         
         # Let LangGraph handle state restoration via checkpointer
-        input_state: AgentState = {"user_input": user_input, **seed_state}
-        
         final_state = await self.graph.ainvoke(input_state, config=config)
         
         if self.debug:
@@ -878,8 +937,6 @@ if __name__ == "__main__":
         asyncio.run(conv.store.flush())
         asyncio.run(conv._cleanup())
         raise
-
-
 
 
 
