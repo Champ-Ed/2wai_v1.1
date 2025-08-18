@@ -170,23 +170,37 @@ for msg in st.session_state.messages:
 
 # --- Chat input box ---
 if prompt := st.chat_input("Type your message and press Enter..."):
-    # 1. Show user message instantly
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    # Generate a unique key for this prompt to prevent duplicate processing
+    import hashlib
+    prompt_key = hashlib.md5(f"{prompt}_{st.session_state.thread_id}_{len(st.session_state.messages)}".encode()).hexdigest()
+    
+    # Check if we've already processed this exact prompt in this session
+    if not hasattr(st.session_state, 'last_processed_prompt_key') or st.session_state.last_processed_prompt_key != prompt_key:
+        # Mark this prompt as being processed
+        st.session_state.last_processed_prompt_key = prompt_key
+        
+        # 1. Show user message instantly
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
 
-    # 2. Get assistant reply
-    with st.chat_message("assistant"):
-        with st.spinner("Calum is thinking..."):
-            # Ensure thread_id is synced before processing
-            st.session_state.conv.session["thread_id"] = st.session_state.thread_id
-            new_state = asyncio.run(st.session_state.conv.run_turn_fast(prompt, st.session_state.state))
-            reply = new_state.get("response", "")
-            st.markdown(reply)
+        # 2. Get assistant reply
+        with st.chat_message("assistant"):
+            with st.spinner("Calum is thinking..."):
+                # Ensure thread_id is synced before processing
+                st.session_state.conv.session["thread_id"] = st.session_state.thread_id
+                # Don't pass any state - let LangGraph's checkpointer handle everything
+                new_state = asyncio.run(st.session_state.conv.run_turn_fast(prompt))
+                reply = new_state.get("response", "")
+                st.markdown(reply)
 
-            # Save state + assistant message
-            st.session_state.state.update(new_state)
-            st.session_state.messages.append({"role": "assistant", "content": reply})
+                # Save state + assistant message
+                st.session_state.state.update(new_state)
+                st.session_state.messages.append({"role": "assistant", "content": reply})
+    else:
+        # This prompt has already been processed, just display the existing messages
+        # The messages are already in st.session_state.messages and will be rendered above
+        pass
 
 # --- End Chat button ---
 col1, col2 = st.columns(2)
@@ -195,6 +209,9 @@ with col1:
         asyncio.run(st.session_state.conv.store.flush())
         st.session_state.messages.clear()
         st.session_state.state = AgentState(session=session, scratchpad=[])
+        # Clear the processed prompt tracking
+        if hasattr(st.session_state, 'last_processed_prompt_key'):
+            delattr(st.session_state, 'last_processed_prompt_key')
         # Generate a new thread for a brand-new conversation and update URL
         st.session_state.thread_id = str(uuid.uuid4())
         try:
