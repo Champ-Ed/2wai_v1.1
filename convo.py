@@ -479,6 +479,10 @@ class OrchestratedConversationalSystem:
             asyncio.create_task(self.store.add_memory(self.agent, f"User: {q}"))
             
             if self.debug:
+                print(f"[NODE] resolve_context: retrieved {len(memories)} memories")
+                print(f"[NODE] resolve_context: memories = {memories}")
+                print(f"[NODE] resolve_context: recent_turns = {recent}")
+                print(f"[NODE] resolve_context: selected_context = {st['selected_context']}")
                 print("[NODE] resolve_context exit")
             return st
 
@@ -503,7 +507,7 @@ class OrchestratedConversationalSystem:
 
         def isolate_context_node(state: AgentState) -> AgentState:
             if self.debug:
-                print("[NODE] isolate_context enter/exit")
+                print("[NODE] isolate_context enter")
             stt = dict(state)
             selected_context = stt.get("selected_context", "")
             compressed_history = stt.get("compressed_history", "")
@@ -511,7 +515,11 @@ class OrchestratedConversationalSystem:
             system_prompt = self._build_system_prompt(selected_context, compressed_history)
             # Add debug print for context
             if self.debug:
-                print("[DL] LLM system prompt built.")
+                print(f"[NODE] isolate_context: selected_context = {selected_context}")
+                print(f"[NODE] isolate_context: compressed_history = {compressed_history}")
+                print(f"[NODE] isolate_context: system_prompt length = {len(system_prompt)}")
+                print(f"[NODE] isolate_context: system_prompt preview = {system_prompt[:500]}...")
+                print("[NODE] isolate_context exit")
             stt["agent_context"] = system_prompt
             return stt
 
