@@ -114,7 +114,7 @@ async def get_embedding(text: str) -> List[float]:
 class DeepLakePDFStore:
     def __init__(self, path: Optional[str] = None, commit_batch: int = 8, debug: bool = False):
         org_id = st.secrets.get("ACTIVELOOP_ORG_ID", "")
-        path = path or f"hub://{org_id}/calum_v8"
+        path = path or f"hub://{org_id}/calum_v10"
         self.dataset_path = path
         self.commit_batch = commit_batch
         self.debug = debug or (os.getenv("DEBUG_CONVO") == "1")
@@ -878,6 +878,7 @@ if __name__ == "__main__":
         asyncio.run(conv.store.flush())
         asyncio.run(conv._cleanup())
         raise
+
 
 
 
