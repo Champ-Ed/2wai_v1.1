@@ -3,6 +3,7 @@ import streamlit as st
 import os
 import asyncio
 import uuid
+import logging
 from typing import TypedDict, List, Optional, Dict, Any, Callable
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -25,6 +26,52 @@ from langsmith.wrappers import wrap_openai
 from typing_extensions import Annotated
 import operator
 import json
+from collections import OrderedDict
+
+# Set up logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# Create console handler with formatting
+if not logger.handlers:
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+
+def fire_and_forget(coro, thread_id: Optional[str] = None, task_name: Optional[str] = None):
+    """Create a background task with proper exception logging and thread correlation.
+    
+    Args:
+        coro: A coroutine to run in the background
+        thread_id: Optional thread ID for correlation logging
+        task_name: Optional task name for better identification
+        
+    Returns:
+        asyncio.Task: The created task with exception handling callback
+    """
+    task = asyncio.create_task(coro)
+    
+    def _callback(t):
+        try:
+            exc = t.exception()
+            if exc:
+                thread_info = f" [thread:{thread_id}]" if thread_id else ""
+                task_info = f" [task:{task_name}]" if task_name else ""
+                logger.exception(f"Background task failed{thread_info}{task_info}", exc_info=exc)
+        except asyncio.CancelledError:
+            thread_info = f" [thread:{thread_id}]" if thread_id else ""
+            task_info = f" [task:{task_name}]" if task_name else ""
+            logger.debug(f"Background task cancelled{thread_info}{task_info}")
+        except Exception as e:
+            thread_info = f" [thread:{thread_id}]" if thread_id else ""
+            task_info = f" [task:{task_name}]" if task_name else ""
+            logger.exception(f"Error inspecting background task{thread_info}{task_info}", exc_info=e)
+    
+    task.add_done_callback(_callback)
+    return task
 
 
 def _read_persona_template(path: Optional[str]) -> str:
@@ -63,11 +110,11 @@ class DiskTidStore:
                 return {}
             data = json.loads(p.read_text(encoding="utf-8"))
             if self.debug:
-                print(f"[DISK] Loaded thread {tid}: keys={list(data.keys())}")
+                logger.debug(f"[DISK] Loaded thread {tid}: keys={list(data.keys())}")
             return data if isinstance(data, dict) else {}
         except Exception as e:
             if self.debug:
-                print(f"[DISK] Load error for {tid}: {e}")
+                logger.error(f"[DISK] Load error for {tid}: {e}")
             return {}
 
     def save(self, tid: str, data: Dict[str, Any]):
@@ -76,10 +123,10 @@ class DiskTidStore:
             p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
             if self.debug:
                 sp = data.get("scratchpad", [])
-                print(f"[DISK] Saved thread {tid}: scratchpad_len={len(sp) if isinstance(sp, list) else 0}")
+                logger.debug(f"[DISK] Saved thread {tid}: scratchpad_len={len(sp) if isinstance(sp, list) else 0}")
         except Exception as e:
             if self.debug:
-                print(f"[DISK] Save error for {tid}: {e}")
+                logger.error(f"[DISK] Save error for {tid}: {e}")
 
 # ---------- Typed states ----------
 class AgentState(TypedDict, total=False):
@@ -118,13 +165,14 @@ class DeepLakePDFStore:
         self.dataset_path = path
         self.commit_batch = commit_batch
         self.debug = debug or (os.getenv("DEBUG_CONVO") == "1")
-        # Simple cache for recent queries
-        self._query_cache = {}
+        # Thread-safe cache with async lock and OrderedDict for LRU behavior
+        self._query_cache = OrderedDict()
+        self._cache_lock = asyncio.Lock()
         self._cache_max_size = 50
         # Per-event-loop locks to avoid cross-loop issues in Streamlit
         self._locks: Dict[int, asyncio.Lock] = {}
         if self.debug:
-            print(f"[DL] Init store path={path} batch={commit_batch}")
+            logger.debug(f"[DL] Init store path={path} batch={commit_batch}")
 
         # Unified read/write store
         self.vector_store = DeepLakeVectorStore(
@@ -148,19 +196,36 @@ class DeepLakePDFStore:
             self._locks[lid] = lock
         return lock
 
+    async def _get_cached(self, key: str) -> Optional[List[str]]:
+        """Thread-safe cache getter."""
+        async with self._cache_lock:
+            return self._query_cache.get(key)
+
+    async def _set_cached(self, key: str, value: List[str]) -> None:
+        """Thread-safe cache setter with LRU eviction."""
+        async with self._cache_lock:
+            # Remove key if it exists (to move it to end)
+            if key in self._query_cache:
+                del self._query_cache[key]
+            # Add/update the key-value pair
+            self._query_cache[key] = value
+            # Evict oldest entries if cache is too large
+            while len(self._query_cache) > self._cache_max_size:
+                self._query_cache.popitem(last=False)  # Remove oldest (FIFO/LRU)
+
     def debug_nodes(self, nodes: List[TextNode]):
         if not self.debug:
             return
-        print(f"[DL] inserting {len(nodes)} node(s):")
+        logger.debug(f"[DL] inserting {len(nodes)} node(s):")
         for n in nodes:
             txt = n.get_content() if hasattr(n, "get_content") else getattr(n, "text", "")
-            print(f"  - id={getattr(n, 'id_', None)} len={len(txt)} meta={getattr(n, 'metadata', {})}")
+            logger.debug(f"  - id={getattr(n, 'id_', None)} len={len(txt)} meta={getattr(n, 'metadata', {})}")
 
     async def add_memory(self, agent: str, text: str):
         if not text:
             return
         if self.debug:
-            print(f"[DL] add_memory queued text='{text[:60]}...'")
+            logger.debug(f"[DL] add_memory queued text='{text[:60]}...'")
         
         # Chunk text
         chunks = self.chunk_text(text)
@@ -185,10 +250,10 @@ class DeepLakePDFStore:
             async with self._loop_lock():
                 await asyncio.to_thread(self._sync_insert_nodes, nodes)
             if self.debug:
-                print("[DL] LlamaIndex insert_nodes done (async)")
+                logger.debug("[DL] LlamaIndex insert_nodes done (async)")
         except Exception as e:
             if self.debug:
-                print(f"[DL] LlamaIndex insert_nodes error: {e}")
+                logger.error(f"[DL] LlamaIndex insert_nodes error: {e}")
 
     def _sync_insert_nodes(self, nodes):
         """Synchronous wrapper for node insertion."""
@@ -203,15 +268,16 @@ class DeepLakePDFStore:
         if not query:
             return []
             
-        # Check cache first
+        # Check cache first using thread-safe method
         cache_key = f"{query[:100]}:{top_k}:{agent_id_filter}"
-        if cache_key in self._query_cache:
+        cached_result = await self._get_cached(cache_key)
+        if cached_result is not None:
             if self.debug:
-                print(f"[DL] rag_query cache hit for: {query[:50]}")
-            return self._query_cache[cache_key]
+                logger.debug(f"[DL] rag_query cache hit for: {query[:50]}")
+            return cached_result
             
         if self.debug:
-            print(f"[DL] rag_query q='{query}' k={top_k} agent_filter={agent_id_filter}")
+            logger.debug(f"[DL] rag_query q='{query}' k={top_k} agent_filter={agent_id_filter}")
 
         try:
             retriever = self.index.as_retriever(similarity_top_k=top_k)
@@ -231,27 +297,23 @@ class DeepLakePDFStore:
 
             results = [node.get_content() for node in nodes]
             
-            # Cache the results
-            if len(self._query_cache) >= self._cache_max_size:
-                # Remove oldest entry
-                oldest_key = next(iter(self._query_cache))
-                del self._query_cache[oldest_key]
-            self._query_cache[cache_key] = results
+            # Cache the results using thread-safe method
+            await self._set_cached(cache_key, results)
 
             if self.debug:
-                print(f"[DL] rag_query fetched {len(nodes)} results in time")
+                logger.debug(f"[DL] rag_query fetched {len(nodes)} results in time")
 
             return results
             
         except asyncio.TimeoutError:
             if self.debug:
-                print(f"[DL] rag_query timed out for query: {query[:50]}")
+                logger.warning(f"[DL] rag_query timed out for query: {query[:50]}")
             return []  # Return empty results on timeout
         except Exception as e:
             # Retry once on transient DeepLake read errors likely due to recent writes
             if "Unable to read sample" in str(e) or "chunks" in str(e):
                 if self.debug:
-                    print("[DL] rag_query transient read error, retrying once...")
+                    logger.warning("[DL] rag_query transient read error, retrying once...")
                 try:
                     await asyncio.sleep(0.25)
                     retriever = self.index.as_retriever(similarity_top_k=top_k)
@@ -262,19 +324,16 @@ class DeepLakePDFStore:
                     async with self._loop_lock():
                         nodes = await asyncio.to_thread(_sync_retrieve2, query)
                     results = [node.get_content() for node in nodes]
-                    # Cache
-                    if len(self._query_cache) >= self._cache_max_size:
-                        oldest_key = next(iter(self._query_cache))
-                        del self._query_cache[oldest_key]
-                    self._query_cache[cache_key] = results
+                    # Cache using thread-safe method
+                    await self._set_cached(cache_key, results)
                     if self.debug:
-                        print(f"[DL] rag_query retry fetched {len(nodes)} results")
+                        logger.debug(f"[DL] rag_query retry fetched {len(nodes)} results")
                     return results
                 except Exception as e2:
                     if self.debug:
-                        print(f"[DL] rag_query retry error: {e2}")
+                        logger.error(f"[DL] rag_query retry error: {e2}")
             if self.debug:
-                print(f"[DL] rag_query error: {e}")
+                logger.error(f"[DL] rag_query error: {e}")
             return []
 
     async def debug_raw_query(self, text: str, k: int = 5, agent="1"):
@@ -286,9 +345,9 @@ class DeepLakePDFStore:
                 filters=MetadataFilters(filters=[ExactMatchFilter(key="agent", value=str(agent))])
             )
         )
-        print("RAW ids:", getattr(raw, "ids", None))
-        print("RAW sims:", getattr(raw, "similarities", None))
-        print("RAW metas:", getattr(raw, "metadatas", None))
+        logger.debug(f"RAW ids: {getattr(raw, 'ids', None)}")
+        logger.debug(f"RAW sims: {getattr(raw, 'similarities', None)}")
+        logger.debug(f"RAW metas: {getattr(raw, 'metadatas', None)}")
 
     def chunk_text(self, text: str, chunk_size: int = 2000, overlap: int = 200) -> List[str]:
         if not text:
@@ -328,15 +387,15 @@ class OrchestratedConversationalSystem:
                 self.checkpointer.storage = dict(st.session_state.checkpoints)  # Make a copy
                 self.session["checkpoint_info"] = f"memory-saver (restored): {len(st.session_state.checkpoints)} checkpoints"
                 if self.debug:
-                    print(f"[CHECKPOINT] Restored {len(st.session_state.checkpoints)} checkpoints from session")
-                    print(f"[CHECKPOINT] Checkpoint keys: {list(st.session_state.checkpoints.keys())}")
+                    logger.debug(f"[CHECKPOINT] Restored {len(st.session_state.checkpoints)} checkpoints from session")
+                    logger.debug(f"[CHECKPOINT] Checkpoint keys: {list(st.session_state.checkpoints.keys())}")
             else:
                 # Initialize session state for checkpoints if it doesn't exist
                 if hasattr(st, 'session_state'):
                     st.session_state.checkpoints = {}
                 self.session["checkpoint_info"] = f"memory-saver (new): session-based persistence"
                 if self.debug:
-                    print("[CHECKPOINT] Starting with empty checkpoints")
+                    logger.debug("[CHECKPOINT] Starting with empty checkpoints")
             
         except Exception as e:
             # Fallback to in-memory if SQLite unavailable
@@ -351,13 +410,19 @@ class OrchestratedConversationalSystem:
         self.store = DeepLakePDFStore(commit_batch=8, debug=self.debug)
         # thresholds (configurable via session)
         self.max_turns = session.get("max_turns", 12)
-        self.summarize_after_turns = session.get("summarize_after_turns", 12)
+        self.summarize_after_turns = session.get("summarize_after_turns", 20)
+        self.turns_to_keep_after_summary = session.get("turns_to_keep_after_summary", 4)
         # Load persona template (path can be overridden via session)
         self.persona_template = _read_persona_template(
             session.get("persona_prompt_path", "calum_prompt_v2.1.yaml")
         )
         # Build the graph but defer compilation until first use
         self._graph = None
+
+    def _fire_and_forget_with_context(self, coro, task_name: Optional[str] = None):
+        """Create a background task with thread context for better logging correlation."""
+        thread_id = self.session.get("thread_id", f"agent-{self.agent}")
+        return fire_and_forget(coro, thread_id=thread_id, task_name=task_name)
 
     async def _ensure_graph(self) -> None:
         """Ensure graph is compiled with checkpointer properly set up."""
@@ -404,55 +469,56 @@ class OrchestratedConversationalSystem:
         graph = StateGraph(AgentState)
 
         async def write_context_node(state: AgentState) -> AgentState:
+            thread_id = self.session.get("thread_id", f"agent-{self.agent}")
             if self.debug:
-                print("[NODE] write_context enter")
-                print(f"[NODE] Incoming state keys: {list(state.keys())}")
+                logger.debug(f"[NODE] write_context enter [thread:{thread_id}]")
+                logger.debug(f"[NODE] Incoming state keys: {list(state.keys())} [thread:{thread_id}]")
                 existing_scratchpad = state.get("scratchpad", [])
-                print(f"[NODE] Existing scratchpad length: {len(existing_scratchpad)}")
+                logger.debug(f"[NODE] Existing scratchpad length: {len(existing_scratchpad)} [thread:{thread_id}]")
                 if existing_scratchpad:
-                    print(f"[NODE] Existing scratchpad: {existing_scratchpad}")
-            stt = dict(state)
-            user_input = stt.get("user_input")
+                    logger.debug(f"[NODE] Existing scratchpad: {existing_scratchpad} [thread:{thread_id}]")
+            state_local = dict(state)
+            user_input = state_local.get("user_input")
             if not user_input:
-                return stt
+                return state_local
             
             # Get existing scratchpad and append new entry
-            existing_scratchpad = stt.get("scratchpad", []) or []
+            existing_scratchpad = state_local.get("scratchpad", []) or []
             new_entry = f"User: {user_input}"
             
             # Simple deduplication: don't add if it's identical to the last entry
             if not existing_scratchpad or existing_scratchpad[-1] != new_entry:
                 new_scratchpad = list(existing_scratchpad) + [new_entry]
-                stt["scratchpad"] = new_scratchpad
+                state_local["scratchpad"] = new_scratchpad
                 if self.debug:
-                    print(f"[NODE] Added user entry, new length: {len(new_scratchpad)}")
+                    logger.debug(f"[NODE] Added user entry, new length: {len(new_scratchpad)} [thread:{thread_id}]")
             else:
                 if self.debug:
-                    print(f"[NODE] Skipped duplicate user entry")
+                    logger.debug(f"[NODE] Skipped duplicate user entry [thread:{thread_id}]")
             
             if self.debug:
-                print("[NODE] write_context exit")
-            return stt
+                logger.debug(f"[NODE] write_context exit [thread:{thread_id}]")
+            return state_local
 
         def select_context_node(state: AgentState) -> AgentState:
             if self.debug:
-                print("[NODE] select_context enter")
-            st = dict(state)
-            user_input = st.get("user_input", "")
-            scratchpad_entries = st.get("scratchpad", [])[-8:]
-            st["selected_context"] = {
+                logger.debug("[NODE] select_context enter")
+            state_local = dict(state)
+            user_input = state_local.get("user_input", "")
+            scratchpad_entries = state_local.get("scratchpad", [])[-8:]
+            state_local["selected_context"] = {
                 "memories_query": user_input,
                 "recent_turns": scratchpad_entries
             }
             if self.debug:
-                print("[NODE] select_context exit")
-            return st
+                logger.debug("[NODE] select_context exit")
+            return state_local
 
         async def resolve_context_node(state: AgentState) -> AgentState:
             if self.debug:
-                print("[NODE] resolve_context enter")
-            st = dict(state)
-            sel = st.get("selected_context", {})
+                logger.debug("[NODE] resolve_context enter")
+            state_local = dict(state)
+            sel = state_local.get("selected_context", {})
             q = sel.get("memories_query", "")
             
             # Fast path: try to get recent memories from cache or use simplified context
@@ -462,78 +528,115 @@ class OrchestratedConversationalSystem:
                 memories = await asyncio.wait_for(memories_task, timeout=1.0)  # 1 second timeout
             except asyncio.TimeoutError:
                 if self.debug:
-                    print("[NODE] Memory query timed out, using fallback")
+                    logger.warning("[NODE] Memory query timed out, using fallback")
                 memories = []  # Fallback to empty memories for fast response
                 # Continue memory query in background
-                asyncio.create_task(self._background_memory_query(q))
+                fire_and_forget(self._background_memory_query(q), thread_id=self.session.get("thread_id"), task_name="background_memory_query")
             except Exception as e:
                 if self.debug:
-                    print(f"[NODE] Memory query error: {e}")
+                    logger.error(f"[NODE] Memory query error: {e}")
                 memories = []
             
             recent = sel.get("recent_turns", [])
-            st["selected_context"] = f"Memories: {' | '.join(memories)}\nRecent: {' | '.join(recent)}"
-            st["top_memory"] = memories[0] if memories else ""
+            state_local["selected_context"] = f"Memories: {' | '.join(memories)}\nRecent: {' | '.join(recent)}"
+            state_local["top_memory"] = memories[0] if memories else ""
             
             # Add user input as memory immediately (but async to avoid blocking)
-            asyncio.create_task(self.store.add_memory(self.agent, f"User: {q}"))
+            fire_and_forget(self.store.add_memory(self.agent, f"User: {q}"), thread_id=self.session.get("thread_id"), task_name="add_user_memory")
             
             if self.debug:
-                print(f"[NODE] resolve_context: retrieved {len(memories)} memories")
-                print(f"[NODE] resolve_context: memories = {memories}")
-                print(f"[NODE] resolve_context: recent_turns = {recent}")
-                print(f"[NODE] resolve_context: selected_context = {st['selected_context']}")
-                print("[NODE] resolve_context exit")
-            return st
+                logger.debug(f"[NODE] resolve_context: retrieved {len(memories)} memories")
+                logger.debug(f"[NODE] resolve_context: memories = {memories}")
+                logger.debug(f"[NODE] resolve_context: recent_turns = {recent}")
+                logger.debug(f"[NODE] resolve_context: selected_context = {state_local['selected_context']}")
+                logger.debug("[NODE] resolve_context exit")
+            return state_local
 
         async def compress_context_node(state: AgentState) -> AgentState:
             if self.debug:
-                print("[NODE] compress_context enter")
-            st = dict(state)
-            scratchpad = st.get("scratchpad", []) or []
+                logger.debug("[NODE] compress_context enter")
+            state_local = dict(state)
+            scratchpad = state_local.get("scratchpad", []) or []
+            
+            # Preserve any existing compressed_history from previous sessions
+            existing_compressed_history = state_local.get("compressed_history", "")
+            
+            # Check if history is long enough to summarize
             if len(scratchpad) >= self.summarize_after_turns:
-                summary = await self._summarize_history(scratchpad)
+                if self.debug:
+                    logger.debug(f"[NODE] compress_context: scratchpad length {len(scratchpad)} >= threshold {self.summarize_after_turns}, summarizing...")
+                
+                # Keep the last N turns to maintain immediate context
+                turns_to_keep = scratchpad[-self.turns_to_keep_after_summary:]
+                history_to_summarize = scratchpad[:-self.turns_to_keep_after_summary]
+                
+                if self.debug:
+                    logger.debug(f"[NODE] compress_context: keeping last {len(turns_to_keep)} turns, summarizing {len(history_to_summarize)} turns")
+                
+                summary = await self._summarize_history(history_to_summarize)
+                
                 if summary:
+                    # Create a new, shorter scratchpad
+                    new_scratchpad = [f"Summary of earlier conversation: {summary}"] + turns_to_keep
+                    state_local["scratchpad"] = new_scratchpad
+                    state_local["compressed_history"] = summary
+                    
+                    # Add the summary to long-term vector memory
+                    fire_and_forget(self.store.add_memory(self.agent, f"Summary: {summary}"), thread_id=self.session.get("thread_id"), task_name="add_summary_memory")
+                    
                     if self.debug:
-                        print(f"[NODE] compress_context: summarizing {len(scratchpad)} entries")
-                    # Add summary to memory store
-                    asyncio.create_task(self.store.add_memory(self.agent, f"Summary: {summary}"))
-                    st["compressed_history"] = summary
-                    # Note: We don't truncate the scratchpad here with operator.add
-                    # The truncation will be handled during persistence
+                        logger.debug(f"[NODE] compress_context: history summarized. New scratchpad length: {len(new_scratchpad)}")
+                        logger.debug(f"[NODE] compress_context: summary: {summary[:100]}...")
+                else:
+                    if self.debug:
+                        logger.warning("[NODE] compress_context: failed to generate summary, keeping original scratchpad")
+                    # Preserve existing compressed history even if new summary failed
+                    if existing_compressed_history:
+                        state_local["compressed_history"] = existing_compressed_history
+            else:
+                if self.debug:
+                    logger.debug(f"[NODE] compress_context: scratchpad length {len(scratchpad)} < threshold {self.summarize_after_turns}, no compression needed")
+                # Preserve existing compressed history when no compression is triggered
+                if existing_compressed_history:
+                    state_local["compressed_history"] = existing_compressed_history
+                    if self.debug:
+                        logger.debug(f"[NODE] compress_context: preserved existing compressed_history: {existing_compressed_history[:100]}...")
+            
             if self.debug:
-                print("[NODE] compress_context exit")
-            return st
+                final_compressed = state_local.get("compressed_history", "")
+                logger.debug(f"[NODE] compress_context: final compressed_history length: {len(final_compressed)}")
+                logger.debug("[NODE] compress_context exit")
+            return state_local
 
         def isolate_context_node(state: AgentState) -> AgentState:
             if self.debug:
-                print("[NODE] isolate_context enter")
-            stt = dict(state)
-            selected_context = stt.get("selected_context", "")
-            compressed_history = stt.get("compressed_history", "")
+                logger.debug("[NODE] isolate_context enter")
+            state_local = dict(state)
+            selected_context = state_local.get("selected_context", "")
+            compressed_history = state_local.get("compressed_history", "")
             # Build system prompt from persona template + injected context
             system_prompt = self._build_system_prompt(selected_context, compressed_history)
             # Add debug print for context
             if self.debug:
-                print(f"[NODE] isolate_context: selected_context = {selected_context}")
-                print(f"[NODE] isolate_context: compressed_history = {compressed_history}")
-                print(f"[NODE] isolate_context: system_prompt length = {len(system_prompt)}")
-                print(f"[NODE] isolate_context: system_prompt preview = {system_prompt[:500]}...")
-                print("[NODE] isolate_context exit")
-            stt["agent_context"] = system_prompt
-            return stt
+                logger.debug(f"[NODE] isolate_context: selected_context = {selected_context}")
+                logger.debug(f"[NODE] isolate_context: compressed_history = {compressed_history}")
+                logger.debug(f"[NODE] isolate_context: system_prompt length = {len(system_prompt)}")
+                logger.debug(f"[NODE] isolate_context: system_prompt preview = {system_prompt[:500]}...")
+                logger.debug("[NODE] isolate_context exit")
+            state_local["agent_context"] = system_prompt
+            return state_local
 
         async def llm_node(state: AgentState) -> AgentState:
             if self.debug:
-                print("[NODE] llm enter")
+                logger.debug("[NODE] llm enter")
                 existing_scratchpad = state.get("scratchpad", [])
-                print(f"[NODE] LLM - Incoming scratchpad length: {len(existing_scratchpad)}")
-            stt = dict(state)
+                logger.debug(f"[NODE] LLM - Incoming scratchpad length: {len(existing_scratchpad)}")
+            state_local = dict(state)
             # Otherwise, call LLM with context
             try:
                 messages = [
-                    {"role": "system", "content": stt.get("agent_context", "")},
-                    {"role": "user", "content": stt.get("user_input", "")}
+                    {"role": "system", "content": state_local.get("agent_context", "")},
+                    {"role": "user", "content": state_local.get("user_input", "")}
                 ]
                 def _call_llm():
                     client = openai.OpenAI(
@@ -550,29 +653,29 @@ class OrchestratedConversationalSystem:
                 answer = resp.choices[0].message.content.strip()
                 
                 # Get existing scratchpad and append assistant response
-                existing_scratchpad = stt.get("scratchpad", []) or []
+                existing_scratchpad = state_local.get("scratchpad", []) or []
                 new_entry = f"{self.session.get('persona_name','Calum')}: {answer}"
                 
                 # Simple deduplication: don't add if it's identical to the last entry
                 if not existing_scratchpad or existing_scratchpad[-1] != new_entry:
                     new_scratchpad = list(existing_scratchpad) + [new_entry]
-                    stt["scratchpad"] = new_scratchpad
+                    state_local["scratchpad"] = new_scratchpad
                     if self.debug:
-                        print(f"[NODE] LLM - Added assistant entry, new length: {len(new_scratchpad)}")
-                    asyncio.create_task(self.store.add_memory(self.agent, new_entry))
+                        logger.debug(f"[NODE] LLM - Added assistant entry, new length: {len(new_scratchpad)}")
+                    fire_and_forget(self.store.add_memory(self.agent, new_entry), thread_id=self.session.get("thread_id"), task_name="add_assistant_memory")
                 else:
                     if self.debug:
-                        print(f"[NODE] LLM - Skipped duplicate assistant entry")
+                        logger.debug(f"[NODE] LLM - Skipped duplicate assistant entry")
                 
-                stt["response"] = answer
+                state_local["response"] = answer
             except Exception as e:
                 if self.debug:
-                    print("[LLM ERROR]", repr(e))
+                    logger.error(f"[LLM ERROR] {repr(e)}")
                     traceback.print_exc()
-                stt["response"] = "Oops — something went wrong. Try again?"
+                state_local["response"] = "Oops — something went wrong. Try again?"
             if self.debug:
-                print("[NODE] llm exit")
-            return stt
+                logger.debug("[NODE] llm exit")
+            return state_local
 
         # register nodes (mix sync & async nodes; LangGraph will handle)
         graph.add_node("write_context", write_context_node)
@@ -611,8 +714,9 @@ class OrchestratedConversationalSystem:
 
     @traceable(name="conversation_turn")
     async def run_turn(self, user_input: str, state: Optional[AgentState] = None) -> AgentState:
+        thread_id = self.session.get("thread_id", f"agent-{self.agent}")
         if self.debug:
-            print(f"[TURN] user_input='{user_input}'")
+            logger.debug(f"[TURN] user_input='{user_input}' [thread:{thread_id}]")
         
         # Ensure graph is ready with async checkpointer
         await self._ensure_graph()
@@ -622,7 +726,7 @@ class OrchestratedConversationalSystem:
         config = {"configurable": {"thread_id": thread_id}}
         
         if self.debug:
-            print(f"[TURN] Using thread_id: {thread_id}")
+            logger.debug(f"[TURN] Using thread_id: {thread_id}")
         
         # Check if checkpointer already has state for this thread
         has_checkpoint = False
@@ -630,10 +734,10 @@ class OrchestratedConversationalSystem:
             existing_state = self.checkpointer.get(config)
             has_checkpoint = existing_state is not None
             if self.debug:
-                print(f"[TURN] Checkpoint exists: {has_checkpoint}")
+                logger.debug(f"[TURN] Checkpoint exists: {has_checkpoint}")
         except Exception as e:
             if self.debug:
-                print(f"[TURN] Error checking checkpoint: {e}")
+                logger.error(f"[TURN] Error checking checkpoint: {e}")
             has_checkpoint = False
         
         # Only seed from disk if no checkpoint exists
@@ -643,40 +747,41 @@ class OrchestratedConversationalSystem:
             if disk_seed.get("scratchpad"):
                 input_state.update(disk_seed)
                 if self.debug:
-                    print(f"[TURN] Seeded from disk: {len(disk_seed.get('scratchpad', []))} entries")
-                    print(f"[TURN] Input state scratchpad: {disk_seed.get('scratchpad', [])}")
+                    logger.debug(f"[TURN] Seeded from disk: {len(disk_seed.get('scratchpad', []))} entries")
+                    logger.debug(f"[TURN] Input state scratchpad: {disk_seed.get('scratchpad', [])}")
         else:
             if self.debug:
-                print("[TURN] Using existing checkpoint, not seeding from disk")
+                logger.debug("[TURN] Using existing checkpoint, not seeding from disk")
         
         if self.debug:
-            print(f"[TURN] About to invoke graph with input_state keys: {list(input_state.keys())}")
+            logger.debug(f"[TURN] About to invoke graph with input_state keys: {list(input_state.keys())}")
             if 'scratchpad' in input_state:
-                print(f"[TURN] Input scratchpad length: {len(input_state['scratchpad'])}")
+                logger.debug(f"[TURN] Input scratchpad length: {len(input_state['scratchpad'])}")
         
         # Let LangGraph handle state restoration via checkpointer
         final_state = await self.graph.ainvoke(input_state, config=config)
         
         if self.debug:
-            print(f"[TURN] Final state scratchpad length: {len(final_state.get('scratchpad', []))}")
+            logger.debug(f"[TURN] Final state scratchpad length: {len(final_state.get('scratchpad', []))}")
         
         # Persist to disk for this tid
         self._persist_thread_to_disk(thread_id, final_state)
         
         if self.session.get("force_sync_flush"):
             if self.debug:
-                print("[TURN] force sync flush")
+                logger.debug("[TURN] force sync flush")
             await self.store.flush()
         else:
-            asyncio.create_task(self.store.flush())
+            fire_and_forget(self.store.flush(), thread_id=thread_id, task_name="store_flush")
         self._save_checkpoints_to_session()
         return final_state
 
     @traceable(name="conversation_turn_fast")
     async def run_turn_fast(self, user_input: str, state: Optional[AgentState] = None) -> AgentState:
         """Fast version that returns response immediately and handles memory operations in background."""
+        thread_id = self.session.get("thread_id", f"agent-{self.agent}")
         if self.debug:
-            print(f"[TURN_FAST] user_input='{user_input}'")
+            logger.debug(f"[TURN_FAST] user_input='{user_input}' [thread:{thread_id}]")
         
         # Ensure graph is ready with async checkpointer
         await self._ensure_graph()
@@ -686,7 +791,7 @@ class OrchestratedConversationalSystem:
         config = {"configurable": {"thread_id": thread_id}}
         
         if self.debug:
-            print(f"[TURN_FAST] Using thread_id: {thread_id}")
+            logger.debug(f"[TURN_FAST] Using thread_id: {thread_id}")
         
         # Check if checkpointer already has state for this thread
         has_checkpoint = False
@@ -694,10 +799,10 @@ class OrchestratedConversationalSystem:
             existing_state = self.checkpointer.get(config)
             has_checkpoint = existing_state is not None
             if self.debug:
-                print(f"[TURN_FAST] Checkpoint exists: {has_checkpoint}")
+                logger.debug(f"[TURN_FAST] Checkpoint exists: {has_checkpoint}")
         except Exception as e:
             if self.debug:
-                print(f"[TURN_FAST] Error checking checkpoint: {e}")
+                logger.error(f"[TURN_FAST] Error checking checkpoint: {e}")
             has_checkpoint = False
         
         # Only seed from disk if no checkpoint exists
@@ -707,55 +812,57 @@ class OrchestratedConversationalSystem:
             if disk_seed.get("scratchpad"):
                 input_state.update(disk_seed)
                 if self.debug:
-                    print(f"[TURN_FAST] Seeded from disk: {len(disk_seed.get('scratchpad', []))} entries")
-                    print(f"[TURN_FAST] Input state scratchpad: {disk_seed.get('scratchpad', [])}")
+                    logger.debug(f"[TURN_FAST] Seeded from disk: {len(disk_seed.get('scratchpad', []))} entries")
+                    logger.debug(f"[TURN_FAST] Input state scratchpad: {disk_seed.get('scratchpad', [])}")
         else:
             if self.debug:
-                print("[TURN_FAST] Using existing checkpoint, not seeding from disk")
+                logger.debug("[TURN_FAST] Using existing checkpoint, not seeding from disk")
         
         if self.debug:
-            print(f"[TURN_FAST] About to invoke graph with input_state keys: {list(input_state.keys())}")
+            logger.debug(f"[TURN_FAST] About to invoke graph with input_state keys: {list(input_state.keys())}")
             if 'scratchpad' in input_state:
-                print(f"[TURN_FAST] Input scratchpad length: {len(input_state['scratchpad'])}")
+                logger.debug(f"[TURN_FAST] Input scratchpad length: {len(input_state['scratchpad'])}")
         
         # Let LangGraph handle state restoration via checkpointer
         final_state = await self.graph.ainvoke(input_state, config=config)
         
         if self.debug:
-            print(f"[TURN_FAST] Final state scratchpad length: {len(final_state.get('scratchpad', []))}")
+            logger.debug(f"[TURN_FAST] Final state scratchpad length: {len(final_state.get('scratchpad', []))}")
         
         # Persist to disk for this tid
         self._persist_thread_to_disk(thread_id, final_state)
         
         # Handle background operations asynchronously (non-blocking)
-        asyncio.create_task(self._background_post_turn_operations())
+        fire_and_forget(self._background_post_turn_operations(), thread_id=thread_id, task_name="post_turn_operations")
         self._save_checkpoints_to_session()
         return final_state
 
     async def _background_post_turn_operations(self):
         """Handle background operations after response is returned."""
+        thread_id = self.session.get("thread_id", f"agent-{self.agent}")
         try:
             if self.debug:
-                print("[BACKGROUND] Running post-turn operations...")
+                logger.debug(f"[BACKGROUND] Running post-turn operations... [thread:{thread_id}]")
             # Just flush memory operations - the actual memory additions happen during graph execution
             await self.store.flush()
             if self.debug:
-                print("[BACKGROUND] Post-turn operations completed")
+                logger.debug(f"[BACKGROUND] Post-turn operations completed [thread:{thread_id}]")
         except Exception as e:
             if self.debug:
-                print(f"[BACKGROUND] Error in post-turn operations: {e}")
+                logger.error(f"[BACKGROUND] Error in post-turn operations: {e} [thread:{thread_id}]")
 
     async def _background_memory_query(self, query: str):
         """Run memory query in background for future use."""
+        thread_id = self.session.get("thread_id", f"agent-{self.agent}")
         try:
             if self.debug:
-                print(f"[BACKGROUND] Running delayed memory query for: {query[:50]}...")
+                logger.debug(f"[BACKGROUND] Running delayed memory query for: {query[:50]}... [thread:{thread_id}]")
             await self.store.rag_query(query, top_k=5, agent_id_filter="1")
             if self.debug:
-                print("[BACKGROUND] Delayed memory query completed")
+                logger.debug(f"[BACKGROUND] Delayed memory query completed [thread:{thread_id}]")
         except Exception as e:
             if self.debug:
-                print(f"[BACKGROUND] Delayed memory query error: {e}")
+                logger.error(f"[BACKGROUND] Delayed memory query error: {e} [thread:{thread_id}]")
 
     def _save_checkpoints_to_session(self):
         """Save checkpoints to Streamlit session state for persistence across reloads."""
@@ -764,8 +871,8 @@ class OrchestratedConversationalSystem:
                 # Make sure we save a copy of the storage dict
                 st.session_state.checkpoints = dict(self.checkpointer.storage)
                 if self.debug:
-                    print(f"[CHECKPOINT] Saved {len(self.checkpointer.storage)} checkpoints to session")
-                    print(f"[CHECKPOINT] Saved checkpoint keys: {list(self.checkpointer.storage.keys())}")
+                    logger.debug(f"[CHECKPOINT] Saved {len(self.checkpointer.storage)} checkpoints to session")
+                    logger.debug(f"[CHECKPOINT] Saved checkpoint keys: {list(self.checkpointer.storage.keys())}")
                     
                     # Debug: look at the latest checkpoint content
                     thread_id = self.session.get("thread_id", f"agent-{self.agent}")
@@ -774,15 +881,15 @@ class OrchestratedConversationalSystem:
                         if thread_id in key_str:
                             try:
                                 scratchpad = self._extract_scratchpad_from_checkpoint(checkpoint)
-                                print(f"[CHECKPOINT] Checkpoint {key_str} scratchpad length: {len(scratchpad) if scratchpad else 0}")
+                                logger.debug(f"[CHECKPOINT] Checkpoint {key_str} scratchpad length: {len(scratchpad) if scratchpad else 0}")
                                 if scratchpad:
-                                    print(f"[CHECKPOINT] Checkpoint {key_str} scratchpad: {scratchpad}")
+                                    logger.debug(f"[CHECKPOINT] Checkpoint {key_str} scratchpad: {scratchpad}")
                             except Exception as e:
-                                print(f"[CHECKPOINT] Error inspecting checkpoint {key_str}: {e}")
+                                logger.error(f"[CHECKPOINT] Error inspecting checkpoint {key_str}: {e}")
                             break
         except Exception as e:
             if self.debug:
-                print(f"[CHECKPOINT] Error saving to session: {e}")
+                logger.error(f"[CHECKPOINT] Error saving to session: {e}")
 
     def _persist_thread_to_disk(self, thread_id: str, state: AgentState):
         """Persist minimal thread state to disk keyed by tid."""
@@ -795,7 +902,7 @@ class OrchestratedConversationalSystem:
             self.disk_store.save(thread_id, data)
         except Exception as e:
             if self.debug:
-                print(f"[DISK] Persist error for {thread_id}: {e}")
+                logger.error(f"[DISK] Persist error for {thread_id}: {e}")
 
     def _load_thread_from_disk(self, thread_id: str) -> Dict[str, Any]:
         data = self.disk_store.load(thread_id)
@@ -806,13 +913,18 @@ class OrchestratedConversationalSystem:
         ch = data.get("compressed_history", "") if isinstance(data, dict) else ""
         if not isinstance(ch, str):
             ch = ""
-        if self.debug and sp:
-            print(f"[DISK] Seeded scratchpad for {thread_id}: len={len(sp)}")
+        if self.debug:
+            if sp:
+                logger.debug(f"[DISK] Seeded scratchpad for {thread_id}: len={len(sp)}")
+            if ch:
+                logger.debug(f"[DISK] Seeded compressed_history for {thread_id}: {ch[:100]}...")
+            if not sp and not ch:
+                logger.debug(f"[DISK] No existing state found for {thread_id}")
         return {"scratchpad": sp, "compressed_history": ch}
 
     # CLI convenience
     async def run_cli(self):
-        print(f"{self.session.get('persona_name','Calum Worthy')} - (type 'exit' to quit)")
+        logger.info(f"{self.session.get('persona_name','Calum Worthy')} - (type 'exit' to quit)")
         # Ensure graph is ready with checkpointer
         await self._ensure_graph()
         try:
@@ -824,7 +936,7 @@ class OrchestratedConversationalSystem:
                 new_state = await self.run_turn(user_input)
                 # Force flush after first turn to ensure tensors exist
                 await self.store.flush()
-                print(f"{self.session.get('persona_name','Calum')}: {new_state.get('response','')}")
+                logger.info(f"{self.session.get('persona_name','Calum')}: {new_state.get('response','')}")
                 # No manual state tracking needed; checkpointer persists it.
         finally:
             await self._cleanup()
@@ -836,7 +948,7 @@ class OrchestratedConversationalSystem:
                 await self._checkpointer_cm.__aexit__(None, None, None)
             except Exception as e:
                 if self.debug:
-                    print(f"[CLEANUP] Error closing checkpointer: {e}")
+                    logger.error(f"[CLEANUP] Error closing checkpointer: {e}")
 
     def _build_system_prompt(self, selected_context: str, compressed_history: str) -> str:
         """Render the persona template with injected context, summary, and current time."""
@@ -931,7 +1043,9 @@ if __name__ == "__main__":
         "avatar_prompts": {"calum": "You are Calum Worthy, a witty activist and actor."},
         "temperature": 0.3,
         "debug": True,               # turn on verbose debug
-        "force_sync_flush": False    # set True to wait every turn
+        "force_sync_flush": False,   # set True to wait every turn
+        "summarize_after_turns": 20, # summarize when chat reaches 20 turns
+        "turns_to_keep_after_summary": 4  # keep last 4 turns after summarizing
     }
     # Initialize the embedding model BEFORE constructing the system
     Settings.embed_model = OpenAIEmbedding(
