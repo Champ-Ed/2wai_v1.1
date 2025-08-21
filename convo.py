@@ -9,7 +9,6 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 # from dotenv import load_dotenv
-import openai
 from llama_index.vector_stores.deeplake import DeepLakeVectorStore
 from llama_index.core.schema import TextNode
 from llama_index.core import VectorStoreIndex
@@ -22,11 +21,13 @@ import traceback
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.core import Settings
 from langsmith import traceable
-from langsmith.wrappers import wrap_openai
 from typing_extensions import Annotated
 import operator
 import json
 from collections import OrderedDict
+
+# Import our unified LLM client
+from llm_client import LLMClient, get_client, initialize_client
 
 # Set up logger
 logger = logging.getLogger(__name__)
@@ -142,15 +143,17 @@ class AgentState(TypedDict, total=False):
 # ---------- Embedding helpers ----------
 @lru_cache(maxsize=4096)
 def cached_openai_embedding(text: str) -> tuple:
-    """Synchronous wrapper (cached) for OpenAI embeddings.
+    """Synchronous wrapper (cached) for OpenAI embeddings using unified client.
        We return a tuple because lists are unhashable for caching; conversion handled by caller."""
     if not text or len(text) > 8192:
         return tuple()
-    resp = openai.embeddings.create(
-        model="text-embedding-3-small",
-        input=[text]
-    )
-    return tuple(resp.data[0].embedding)
+    try:
+        client = get_client()
+        embedding = client.embed(text)
+        return tuple(embedding)
+    except Exception as e:
+        logger.error(f"Embedding failed: {e}")
+        return tuple()
 
 async def get_embedding(text: str) -> List[float]:
     # run the cached call in a threadpool so it doesn't block the event loop
@@ -372,6 +375,19 @@ class OrchestratedConversationalSystem:
         # Initialize debug early
         self.debug = session.get("debug", False) or (os.getenv("DEBUG_CONVO") == "1")
         
+        # Initialize the unified LLM client
+        try:
+            initialize_client(
+                api_key=session["api_key"],
+                base_url=session.get("base_url", "https://api.openai.com/v1"),
+                enable_tracing=True
+            )
+            if self.debug:
+                logger.debug("LLM client initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize LLM client: {e}")
+            raise
+        
         # Initialize persistent checkpointer
         db_cfg = self.session.get("checkpoint_db", os.getenv("LANGGRAPH_CHECKPOINT_DB", "checkpoints.sqlite"))
         
@@ -447,19 +463,15 @@ class OrchestratedConversationalSystem:
             f"Summarize this conversation in 1-2 witty sentences especially remembering peculiar things:\n{' | '.join(history)}"
         )
         try:
-            client = openai.OpenAI(
-                api_key=self.session["api_key"],
-                base_url=self.session.get("base_url", "https://api.openai.com/v1"),
-            )
-            # Wrap client for LangSmith tracing
-            client = wrap_openai(client)
-            resp = client.chat.completions.create(
-                model=self.session.get("model_name", "gpt-4o"),
+            client = get_client()
+            resp = client.chat(
                 messages=[{"role": "user", "content": prompt}],
+                model=self.session.get("model_name", "gpt-4o"),
                 temperature=0.3,
             )
             return resp.choices[0].message.content.strip()
-        except Exception:
+        except Exception as e:
+            logger.error(f"History summarization failed: {e}")
             return ""
 
     async def _summarize_history(self, history: List[str]) -> str:
@@ -639,14 +651,10 @@ class OrchestratedConversationalSystem:
                     {"role": "user", "content": state_local.get("user_input", "")}
                 ]
                 def _call_llm():
-                    client = openai.OpenAI(
-                        api_key=self.session["api_key"],
-                        base_url=self.session.get("base_url", "https://api.openai.com/v1"),
-                    )
-                    client = wrap_openai(client)
-                    return client.chat.completions.create(
-                        model=self.session.get("model_name", "gpt-4o"),
+                    client = get_client()
+                    return client.chat(
                         messages=messages,
+                        model=self.session.get("model_name", "gpt-4o"),
                         temperature=self.session.get("temperature", 0.3)
                     )
                 resp = await asyncio.to_thread(_call_llm)
