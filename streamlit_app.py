@@ -1,10 +1,23 @@
 import os
 import asyncio
+import logging
 import streamlit as st
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.core import Settings
 import uuid
 import aiosqlite
+
+# Set up logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# Create console handler with formatting
+if not logger.handlers:
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
 
 # LangSmith tracing (export env from Streamlit secrets) BEFORE importing convo
 os.environ.setdefault("LANGCHAIN_API_KEY", st.secrets.get("LANGCHAIN_API_KEY", ""))
